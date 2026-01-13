@@ -1,0 +1,554 @@
+#Import the necessary libraries
+#general libraries
+library(tidyverse)
+library(dplyr)
+library(labelled)
+#plotting libraries
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(treemapify)
+library(maps)
+#modeling libraries
+library(performance)
+library(modelsummary)
+library(marginaleffects)
+library(nnet)
+library(MASS)
+library(brant)
+library(VGAM)
+library(nnet)
+
+#DATA PROCESSING AND COMBINATION===========================================
+#PEW POLL DATA=====================================================
+#import each of the raw datasets, very expensive, very slow.
+PEW_world <- read.csv("Pew-Research-Center-Global-Attitudes-Spring-2024-SurveyPublic/Pew Research Center Global Attitudes Spring 2024 Dataset CSV.csv") %>%
+dplyr::select(country, econ_sit, satisfied_democracy,
+fav_us, fav_china, fav_eu, fav_un, fav_russia, gender, gender_australia, age,
+d_age_australia, d_class,
+prob_rich_poor, prob_gen_unequal, prob_racediscrim, prob_reldiscrim,
+prob_misinformation) %>%
+mutate(across(2:ncol(.), ~ ifelse(.x %in% c(8, 9, 99), NA, .x)),
+gender = ifelse(country == 13 & gender_australia != 3, gender_australia,
+gender),
+age = cut(age, breaks = c(17, 29, 49, 64, Inf), labels = c(1:4)),
+age = ifelse(country == 13, d_age_australia, age),
+income_tier = cut(d_class, breaks = c(0, 1, 3, 6), labels(1:3))) %>%
+dplyr::select(country, econ_sit, satisfied_democracy, fav_us, fav_china,
+fav_eu, fav_un,
+fav_russia, gender, age, income_tier, prob_rich_poor,
+prob_gen_unequal, prob_racediscrim, prob_reldiscrim, prob_misinformation)
+#USA Data is separate and needs to be renamed and added as country 1
+#I am using a similar survey from April 2024 as recommended by PEW
+PEW_USA <- read.csv("W145_Apr24/ATP W145.csv") %>%
+dplyr::select(ECON_SIT_W145, FAV_US_W145, SATISFIED_DEMOCRACY_W145,
+FAV_CHINA_W145,
+FAV_EU_W145, FAV_UN_W145, FAV_RUSSIA_W145, F_AGECAT, F_GENDER, F_INC_TIER2,
+PROB_RICH_POOR_W145, PROB_GEN_UNEQUAL_W145, PROB_RACEDISCRIM_W145,
+PROB_RELDISCRIM_W145, PROB_MISINFORMATION_W145) %>%
+rename(econ_sit = ECON_SIT_W145,
+satisfied_democracy = SATISFIED_DEMOCRACY_W145,
+fav_us = FAV_US_W145,
+fav_china = FAV_CHINA_W145,
+fav_eu = FAV_EU_W145,
+fav_un = FAV_UN_W145,
+fav_russia = FAV_RUSSIA_W145,
+age = F_AGECAT,
+gender = F_GENDER,
+income_tier = F_INC_TIER2,
+prob_rich_poor = PROB_RICH_POOR_W145,
+prob_gen_unequal = PROB_GEN_UNEQUAL_W145,
+prob_racediscrim = PROB_RACEDISCRIM_W145,
+prob_reldiscrim = PROB_RELDISCRIM_W145,
+prob_misinformation = PROB_MISINFORMATION_W145) %>%
+mutate(country = 1, .before = econ_sit) %>%
+mutate(across(everything(), ~ ifelse(.x %in% 99, NA, .x)))
+#create a combined dataset and add the country factor
+PEW <- rbind(PEW_USA, PEW_world) %>%
+mutate(country = as.character(factor(country, levels = c(1:36), labels = c(
+"USA", "Canada", "France", "Germany", "Greece", "Hungary",
+"Italy", "Netherlands", "Poland", "Spain", "Sweden", "UK",
+"Australia", "Bangladesh", "India", "Indonesia", "Japan",
+"Malaysia", "Philippines", "Singapore", "South Korea",
+"Sri Lanka", "Thailand", "Israel", "Tunisia", "Turkey",
+"Ghana", "Kenya", "Nigeria", "South Africa", "Argentina",
+"Brazil", "Chile", "Colombia", "Mexico", "Peru")))) %>%
+#Exclude Bangladesh, Indonesia, Tunisia and Nigeria because no
+satisfied_democracy var
+dplyr::filter(!country %in% c("Bangladesh", "Indonesia", "Tunisia",
+"Nigeria"))
+#save a list of countries to as a index for RUST
+countries <- as.character(unique(PEW$country))
+countries
+#Group by country and get the means for each category
+PEW_national_means <- PEW %>%
+group_by(country) %>%
+summarise(
+econ_sit = mean(econ_sit, na.rm = TRUE),
+satisfied_democracy = mean(satisfied_democracy, na.rm = TRUE),
+fav_us = mean(fav_us, na.rm = TRUE),
+fav_china = mean(fav_china, na.rm = TRUE),
+fav_eu = mean(fav_eu, na.rm = TRUE),
+fav_un = mean(fav_un, na.rm = TRUE),
+fav_russia = mean(fav_russia, na.rm = TRUE),
+n = n()
+)
+# Check the basic summary stats
+head(PEW_national_means)
+#RUSSIAN TRADE DATA RUS(T)=================================================
+RUST <- read.csv("2013-2024Trade.csv", row.names=NULL) #load Russian trade as
+RUST
+class(RUST)
+length(RUST)
+names(RUST)
+#Import the data and check if there is a need for cleaning
+RUST_world <- RUST %>%
+mutate(ShippingMethod = factor(mosCode, levels = unique(mosCode), labels =
+unique(motCode)),
+Value_millions = if_else(reporterDesc %in% c("DX", "X", "XIP",
+"XOP"),cifvalue, fobvalue) / 1000000,
+Year = as.integer(refPeriodId),
+country = reporterISO,
+FlowType = flowCode,
+code = reporterCode,
+Import = reporterDesc %in% c("M", "RM")) %>%
+mutate(country = ifelse(code == "GBR", "UK", country)) %>%
+mutate(country = ifelse(code == "KOR", "South Korea", country)) %>%
+mutate(country = ifelse(code == "TUR", "Turkey", country))
+RUST <- RUST_world %>%
+dplyr::filter(country %in% countries) %>%
+dplyr::select(Year, Value_millions, country, FlowType, Import)
+#Group by country and find the values every year
+RUST_national <- RUST %>%
+group_by(country, Year) %>%
+summarise(Value_millions = sum(Value_millions), .groups = 'drop')
+#Take pre and postwar averages
+RUST_prewar <- RUST_national %>%
+dplyr::filter(Year < 2019) %>%
+group_by(country) %>%
+summarise(avgvalpre = sum(Value_millions) / 7)
+RUST_postwar <- RUST %>%
+dplyr::filter(Year > 2021) %>%
+group_by(country) %>%
+summarise(avgvalpost = sum(Value_millions) / 3)
+#Excluding covid, find the change in average trade pre-post war
+RUST_delta <- full_join(RUST_prewar, RUST_postwar, by = "country") %>%
+group_by(country) %>%
+summarise(delta_pct = (avgvalpost - avgvalpre) / avgvalpre * 100,
+avgpre = avgvalpre,
+avgpost = avgvalpost)
+#===================FINAL Data Cleaning Steps===================================
+#Double check to make sure no countries "disappeared"
+unique(RUST$country) #32
+unique(PEW$country) #32
+# NEW PEW that adds delta pct
+lvl_order <- c("Very favorable", "Somewhat favorable", "Somewhat unfavorable",
+"Very unfavorable")
+PEW <- PEW %>%
+left_join(RUST_delta, by = "country") %>%
+filter(complete.cases(.)) %>%
+mutate(fav_russia = factor(fav_russia, levels = c(1:4),
+labels = lvl_order, ordered = TRUE),
+gender = factor(gender, levels = c(1:3), labels = c("Male", "Female",
+"Other")),
+age = factor(age, levels = c(1:4), labels = c("18-29", "30-49", "50-64",
+"65+")),
+income_tier = factor(income_tier, levels = c(1:3), labels = c("upper
+class", "middle class", "lower class"), ordered = TRUE),
+econ_sit = factor(econ_sit, levels = c(1:4), labels = c("Very good",
+"Somewhat good", "Somewhat bad", "Very bad"), ordered = TRUE),
+satisfied_democracy = factor(satisfied_democracy, levels = c(1:4), labels =
+c("Very satisfied", "Somewhat satisfied",
+"Not too satisfied", "Not at all satisfied"), ordered = TRUE),
+fav_us = factor(fav_us, levels = c(1:4),
+labels = lvl_order, ordered = TRUE),
+fav_china = factor(fav_china, levels = c(1:4),
+labels = lvl_order, ordered = TRUE),
+fav_eu = factor(fav_eu, levels = c(1:4),
+labels = lvl_order, ordered = TRUE))
+length(PEW$country) #retains approx. 31,000 points
+#Add a binomial option since assumptions are violated
+PEW$russia_binom <- fct_collapse(PEW$fav_russia,
+"Unfavorable" = c("Somewhat unfavorable", "Very unfavorable"),
+"Favorable" = c("Very favorable", "Somewhat favorable")) %>%
+fct_relevel("Unfavorable", "Favorable")
+#Make a more limited "friendly dataframe" for practical significance testing
+#included countries are India, Brazil, Hungary, Singapore and Turkey
+PEW_friendly <- PEW %>%
+dplyr::filter(country %in% c("India", "Brazil", "Hungary", "Singapore",
+"Turkey"))
+#=========Visualization Prep=====================================================
+#group by country for scene-setting visualizations
+PEW_grouped <- PEW %>%
+group_by(country) %>%
+summarise(russia_pct = mean(russia_binom == "Favorable"))
+#Combine RUST and PEW to get the data in one place
+#Lower means more favorable for all opinion
+means <- full_join(PEW_national_means, PEW_grouped, by = "country")
+means <- full_join(means, RUST_delta, by = "country")
+#Create a separate Map Data df using the maps library
+map <- map_data('world') %>%
+rename(country = region)
+world_data <- full_join(map, means, by = "country") %>%
+dplyr::filter(country %in% countries)
+#check all countries are spelled the same
+unique(world_data$country)
+unique(means$country)
+#===Scene Setting, initial graphing and data exploration=======================
+#Create the intro map image to show global opinions and included countries
+mapimage <- map_data('world') %>%
+ggplot(aes(x = long, y = lat, group = group))+
+geom_polygon(data = map, fill = "white", color = "gray")+
+geom_polygon(data = world_data, aes(x = long, y = lat, group = group, fill =
+russia_pct))+
+scale_fill_gradient(low = "red", high = "#068711") +
+labs(title = "Spring 2024 Average Favourability Scores of Russia",
+subtitle = "Percentage of Respondents with a Favourable opinion of Russia",
+caption = "Favoruability is the grouped 'somewhat favourable' and 'very
+favourable' response \n Source:PEW",
+fill = "Percentage") +
+theme_void(base_size = 20) +
+coord_quickmap()
+#save as a png, since maps saves as a low-res square by default
+ggsave(filename = "map.png", plot = mapimage, height = 7, width = 14)
+#Look at the change in trade from each country over time
+columns <- RUST %>%
+group_by(country) %>%
+dplyr::filter(any(Value_millions >= 3000)) %>%
+ggplot(aes(x = Year, y = Value_millions, fill = FlowType))+
+scale_x_continuous(breaks = seq(min(RUST$Year), max(RUST$Year), by = 10)) +
+geom_col()+
+geom_smooth(aes(color = FlowType),method = "lm", se = FALSE)+
+scale_color_manual(values = c("Import" = "#068711", "Export" = "red")) +
+facet_wrap(~country, drop = TRUE, scales = "free") +
+theme_minimal(base_size = 20)+
+labs(title = "Trade with Russia Over time by Country",
+subtitle = "Only countries with at least one year of 3 billion dollars of total
+trade included",
+color = "Predicted Trade", y = 'Value in millions of dollars',
+caption = "Trade is the sum of imports and exports from the Comtrade database
+where X country is the reporter and Russia is the partner \n Source: UN
+Comtrade")
+#Tree and total trade are both not used but were used to support the conclusions
+#in the article's exposition.
+total_trade <- RUST_world %>%
+ggplot(aes(x = Year, y = Value_millions, fill = FlowType)) +
+geom_col() +
+theme_minimal(base_size = 20)+
+labs(title = "Total Russian Trade since 2013", y = "Value of Trade in
+Millions", x = "Year",
+subtitle = "Including all countries in UN comtrade database")
+tree <- RUST %>%
+group_by(country) %>%
+ggplot(aes(area = Value_millions, label = country, fill = FlowType, subgroup =
+FlowType))+
+geom_treemap()+
+geom_treemap_subgroup_border() +
+facet_wrap(~Year) +
+theme_minimal(base_size = 40) +
+geom_treemap_text(fontface = "italic", colour = "white", place = "centre", grow =
+TRUE) +
+labs(title = "Russian imports and exports from included countries over time",
+subtitle = "The yearly total represented by each block is the total of included
+countries")
+#Save all as a PNG for better size and scale control
+ggsave(filename = "trade.png",
+plot = columns,
+width = 15, height = 20)
+ggsave(filename = "TotalTrade.png",
+plot = total_trade)
+ggsave(filename = "tree.png",
+plot = tree,
+width = 30, height = 30)
+#================Visual Problem Exploration=================================
+#Graph trade against opinion in a few key metrics, use a glm to model.
+#This both checks to see if there is any validity in my hypothesis and provides
+the reader
+#with a useful general outline
+# make some basic graphs for trends in opinion and delta trade (lower is more
+positive)
+fav_RUS <- means %>%
+ggplot(aes(x = fav_russia, y = delta_pct, size = avgpre, color = fav_russia))+
+geom_point() +
+geom_smooth(method = "glm") +
+theme_minimal(base_size = 25) +
+geom_label_repel(aes(label = country), size = 7, max.overlaps = 15,
+min.segment.length = 0)+
+labs(title ="Change in Russian trade against opinion of Russia", y ="% change in
+average trade with Russia post war",
+x = "Perceived favourability of Russia", size = "Prewar Trade Volume", color =
+"Favourability of Russia")
+fav_EU <- means %>%
+ggplot(aes(x = fav_eu, y = delta_pct, size = avgpre, color = fav_eu))+
+geom_point() +
+geom_smooth(method = "glm") +
+theme_minimal(base_size = 25) +
+geom_label_repel(aes(label = country), size = 7, max.overlaps = 15,
+min.segment.length = 0)+
+labs(title ="Change in Russian trade against opinion of the EU", y ="% change in
+average trade with Russia trade post war",
+x = "Perceived favourability of the EU", size = "Prewar Trade Volume", color =
+"Favourability of the EU")
+fav_US <- means %>%
+ggplot(aes(x = fav_us, y = delta_pct, size = avgpre, color = fav_us))+
+geom_point() +
+geom_smooth(method = "glm") +
+theme_minimal(base_size = 25) +
+geom_label_repel(aes(label = country), size = 7, max.overlaps = 20,
+min.segment.length = 0)+
+labs(title ="Change in Russian trade against opinion of the US", y ="% change in
+average trade with Russia post war",
+x = "Perceived favourability of the US", size = "Prewar Trade Volume", color =
+"Favourability of the US")
+# Combine the above graphs for presentation, add labels
+opinions <- fav_RUS / fav_EU / fav_US +
+plot_annotation(title = "National changes in trade with Russia across average
+favourability",
+subtitle = "Delta Trade is the percentage change in trade from the 2013-2019 to
+the 2022-2024 average \n Lower favourability scores are more favorable \n Grey
+indicites 95% CI \n Sources: PEW, UN Comtrade",
+theme = theme_minimal(base_size = 30))
+#save the charts as a png for formatting control
+ggsave(file = "tradeopinion.png",
+plot = opinions, width = 20, height = 45)
+#=============================Modeling the data===============================
+#Since favourability towards Russia is just 4 discrete ordered categories we will
+proceed with ordinal
+# logistic regression
+ord_model <- polr(fav_russia ~ age + gender + income_tier + econ_sit +
+log(abs(delta_pct)) + satisfied_democracy + fav_us + fav_eu + fav_china +
+prob_racediscrim + prob_reldiscrim + prob_rich_poor + prob_misinformation, PEW,
+Hess = TRUE)
+#the brant test reveals that the categories are not close to proportional
+brant <- brant(ord_model)
+as.data.frame(brant)
+write.csv(brant, file = "brant.csv", row.names = TRUE)
+#a partial proportional odds model can allow for categories that are not
+proportional
+#This is not ideal but maintains the clear order that fav_russia has
+vg <- vglm(fav_russia ~ age + gender + income_tier + econ_sit + delta_pct +
+satisfied_democracy + fav_us + fav_eu + fav_china +
+prob_racediscrim + prob_reldiscrim + prob_rich_poor + prob_misinformation,
+cumulative(link = "logitlink", parallel = FALSE ~ prob_rich_poor +
+prob_reldiscrim + age + gender + fav_us), data = PEW)
+#We could ignore the order of fav_russia and use a MLR model though this loses a
+lot of the interpretability
+#this also does not make intuitive sense as they are not IIA
+multi_model <- nnet::multinom(fav_russia ~ age + gender + income_tier + econ_sit
++ log(abs(delta_pct)) + satisfied_democracy + fav_us + fav_eu + fav_china +
+prob_racediscrim + prob_reldiscrim + prob_rich_poor + prob_misinformation, data
+= PEW)
+multi_check <- check_model(multi_model, residual_type = "normal")
+binary_mdl <- glm(russia_binom ~ age + gender + income_tier + econ_sit +
+log(abs(delta_pct)) + satisfied_democracy + fav_us + fav_eu + fav_china +
+prob_racediscrim + prob_reldiscrim + prob_rich_poor + prob_misinformation,
+family = binomial, data = PEW)
+#=============================Testing the model==============================
+#check basic stats for the competing models
+results_table <- t(data.frame(ord_AIC =AIC(ord_model), #out of the question
+because of brant included for perspective
+partial_AIC = AIC(vg),
+multinom_AIC = AIC(multi_model),
+binary_AIC = AIC(binary_mdl), #best by far (unfair by construction 50/50 vs 1/4)
+ord_BIC = BIC(ord_model), #same as above
+partial_BIC = BIC(vg),
+multinom_BIC = BIC(multi_model),
+binary_BIC = BIC(binary_mdl)))
+write.csv(results_table, file = "modelresults.csv")
+# we can run the drop to see if there are any unneeded vars
+drop <- MASS::dropterm(binary_mdl, trace = TRUE, test = "Chisq")
+drop #drop shows all vars are warranted
+#we can run check_model to see if there are any easily detectible problems
+check_model(binary_mdl)
+#binned residuals are not within the errors this means there are missing
+variables, the model is systematically
+#wrong when prob ~15%
+#get the summary statistics
+binary_summary <- modelsummary(binary_mdl, stars = TRUE,
+title = "Binary Model Exponentiated Coefficients")
+binary_summary
+#=========================SUBSTANTIVE VISUALISATIONS==========================
+#=====Confusion Matrices for the binomial model=================================
+preds <- predictions(binary_mdl) %>%
+mutate(pred_class = (if_else(estimate > .5, "Favorable", "Unfavorable")),
+actual = PEW$russia_binom) %>%
+group_by(pred_class, actual) %>%
+tally() %>%
+mutate(pct = round(n / sum(n) * 100, 2))
+binary_confusion <- preds %>%
+ggplot(aes(y = pred_class, x = actual, fill = pct))+
+geom_bin_2d(bins = 2) +
+scale_fill_gradient(high = "red", low = "white")+
+geom_text(aes(label = paste0(pct, "%")), size = 30)+
+theme_minimal(base_size = 50) +
+theme(legend.position = "") +
+labs(x = "Actual level", y = "Predicted level",
+title = "Binary Logistic Regression Predicted vs Actual Opinions of Russia",
+subtitle = "Percentages are calculated by predicted class")
+ggsave(file = "binary.png", plot = binary_confusion,
+width = 40, height = 20)
+#Create a confusion matrix for the partial prop. odds model
+#Predict for each row, for the vg model
+partial_preds <- fitted(vg)
+partial_preds <- colnames(partial_preds)[max.col(partial_preds)]
+results <- data.frame(
+actual = PEW$fav_russia,
+predicted = partial_preds)
+#Tally for the whole thing
+pred_counts <- results %>%
+count(actual, predicted)
+#Count it and combine, get percentage
+pred_counts <- pred_counts %>%
+mutate(predicted = factor(predicted, levels = lvl_order, ordered = TRUE),
+actual = factor(actual, levels = lvl_order, ordered = TRUE)) %>%
+arrange(predicted, actual) %>%
+group_by(predicted) %>%
+mutate(pct = round(n / sum(n) * 100, 2))
+#Visualise
+partial_conf <- pred_counts %>%
+ggplot(aes(x = actual, y = predicted, fill = pct))+
+geom_bin_2d(bins = 4)+
+scale_fill_gradient(high = "red", low = "white" )+
+geom_text(aes(label = paste0(pct, "%")), size = 10)+
+theme_minimal(base_size = 50) +
+theme(legend.position = "")+
+labs(title = "Partial Proportional Odds Predicted vs Actual Opinions of Russia",
+y = "Predicted level",
+x = "Actual level", subtitle = "Percentages are calculated by predicted class")
+ggsave(file = "partialconf.png", plot = partial_conf,
+width = 40, height = 20)
+#the binned residuals are still not in error bounds but adding more complexity
+risks overfitting
+#The multi model performs well enough, but loses the ordinarily of the original
+# and loses the interpretability of the coefficients
+#==========================================Article visualizations============
+#plot the favourability comparison to show the extreme importance of China
+pew_slopes_fav <- avg_slopes(binary_mdl, variables = c("fav_china", "fav_eu",
+"fav_us",
+"econ_sit", "satisfied_democracy")) %>%
+mutate(term = recode(term, fav_china = "China", fav_eu = "the EU", fav_us =
+"USA",
+econ_sit = "Home Country's Economic Situation", satisfied_democracy = "Home
+Country's Democracy"))
+slopes_plot_fav <- pew_slopes_fav %>%
+ggplot(aes(x = contrast, y = estimate, color = term)) +
+geom_point(size = 10)+
+geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, linewidth =
+1)+
+labs(title = "Predicted Change in the Likelihood of Approving of Russia", x =
+"Contrasted Responses",
+y = "Estimated Change in the likelihood of approving of Russia", color =
+"Respondant's Opinion of:", caption = "95% CI \n Sources: PEW, UN Comtrade")+
+geom_hline(yintercept = 0, linetype = "dashed", color = "red")+
+coord_flip()+
+theme_minimal(base_size = 15)
+slopes_plot_fav
+#plot predicted approval over trade
+trade_preds <- plot_predictions(binary_mdl, condition = "delta_pct", draw =
+FALSE)
+ggplot()+
+geom_line(aes(x = delta_pct, y = estimate, color = estimate), data = trade_preds)
++
+scale_color_gradient(low = "red", high = "green")+
+labs(x = "% Change in trade with Russia since 2022", y = "Estimated liklihood of
+having a 'favourable' view of Russia",
+title = "Predicted change in support of Russia Accross Trade Change", caption =
+"Sources: PEW, UN Comtrade")+
+theme_minimal(base_size = 20)+
+theme(legend.position = "none")
+#========================================Appendix visualizations============
+delta_pr <- plot_predictions(binary_mdl, condition = "delta_pct") +
+theme_minimal(base_size = 40)
+fav_eu_pr <- plot_predictions(binary_mdl, condition = "fav_eu") +
+theme_minimal(base_size = 27) +
+labs(title = "By Perceived Favoribility of the EU", y = "Predicted likelihood of
+having a favorable opinion of Russia",
+x = "Perceived favoribility of the EU")
+fav_us_pr <- plot_predictions(binary_mdl, condition = "fav_us") +
+theme_minimal(base_size = 27) +
+labs(title = "By Perceived Favoribility of the US", y = "Predicted likelihood of
+having a favorable opinion of Russia",
+x = "Perceived Favoribility of the US")
+fav_china_pr <- plot_predictions(binary_mdl, condition = "fav_china") +
+theme_minimal(base_size = 27) +
+labs(title = "By Perceived Favoribility of China", y = "Predicted likelihood of
+having a favorable opinion of Russia",
+x = "Perceived Favoribility of China")
+#combine them for better display
+combined <- delta_pr + (fav_eu_pr / fav_us_pr / fav_china_pr)
+#save because the font size it too small by default
+ggsave(file = "marginal_plot.png",
+plot = combined,
+height = 40, width = 30)
+#Create a larger slope prediction graph that includes every factor to ascertain
+practial significance
+pew_slopes_pract <- avg_slopes(binary_mdl, variables = c("fav_china", "fav_eu",
+"fav_us",
+"econ_sit", "satisfied_democracy", "age", "gender", "income_tier")) %>%
+mutate(term = recode(term, fav_china = "China", fav_eu = "the EU", fav_us =
+"USA",
+econ_sit = "Home Country's Economic Situation", satisfied_democracy = "Home
+Country's Democracy"))
+slopes_plot_pract <- pew_slopes_pract %>%
+ggplot(aes(x = contrast, y = estimate, color = term)) +
+geom_point(size = 10)+
+geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, linewidth =
+1)+
+labs(title = "Predicted Change in the Liklihood of Approving of Russia by
+Factor", x = "Contrasted Responses",
+y = "Estimated Change in the liklihood of approving of Russia", color =
+"Factor:", caption = "95% CI \n Sources: PEW, UN Comtrade")+
+geom_hline(yintercept = 0, linetype = "dashed", color = "red")+
+coord_flip()+
+theme_minimal(base_size = 15)
+slopes_plot_pract
+#For the problem questions: plot the derivatives to get a sense of relative scale
+pew_slopes_dydx <- avg_slopes(binary_mdl, variables = c("prob_rich_poor",
+"prob_racediscrim", "prob_reldiscrim",
+"prob_misinformation")) %>%
+mutate(term = recode(term, fav_china = "China", fav_eu = "the EU", fav_us =
+"USA",
+econ_sit = "Home Country's Economic Situation", satisfied_democracy = "Home
+Country's Democracy"))
+slopes_plot_dydx <- pew_slopes_dydx %>%
+ggplot(aes(x = contrast, y = estimate, color = term)) +
+geom_point(size = 10)+
+geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, linewidth =
+1)+
+labs(title = "Predicted Change in the Liklihood of Approving of Russia by
+Factor", x = "Contrasted Responses",
+y = "Estimated Change in the liklihood of approving of Russia", color =
+"Variable:", caption = "95% CI \n Sources: PEW, UN Comtrade")+
+geom_hline(yintercept = 0, linetype = "dashed", color = "red")+
+coord_flip()+
+theme_minimal(base_size = 15)
+slopes_plot_dydx
+#Plot the marginal effect among the most friendly countries to check for
+practical significance
+#train the same model but with the restricted country set
+friendly_binary_mdl <- glm(russia_binom ~ age + gender + income_tier + econ_sit +
+log(abs(delta_pct)) + satisfied_democracy + fav_us + fav_eu + fav_china +
+prob_racediscrim + prob_reldiscrim + prob_rich_poor + prob_misinformation,
+family = binomial, data = PEW_friendly)
+#plot the average slopes of key variables
+pew_slopes_friend <- avg_slopes(friendly_binary_mdl, variables = c("fav_china",
+"fav_eu", "fav_us",
+"econ_sit", "satisfied_democracy")) %>%
+mutate(term = recode(term, fav_china = "China", fav_eu = "the EU", fav_us =
+"USA",
+econ_sit = "Home Country's Economic Situation", satisfied_democracy = "Home
+Country's Democracy"))
+#visualise the slopes-- China is still the most important
+slopes_plot_friend <- pew_slopes_friend %>%
+ggplot(aes(x = contrast, y = estimate, color = term)) +
+geom_point(size = 10)+
+geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, linewidth =
+1)+
+labs(title = "Predicted Change in the Liklihood of Approving of Russia", x =
+"Contrasted Responses",
+y = "Estimated Change in the liklihood of approving of Russia among 'friendly'
+democracies", color = "Respondant's Opinion of:", caption = "95% CI \n Sources:
+PEW, UN Comtrade")+
+geom_hline(yintercept = 0, linetype = "dashed", color = "red")+
+coord_flip()+
+theme_minimal(base_size = 15)
